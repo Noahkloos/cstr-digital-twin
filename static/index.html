@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSTR Digital Twin</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <!--
+    Bibliotheken: eerst lokaal (static/vendor, via scripts/download_vendor.py),
+    anders automatisch terugvallen op de CDN.
+  -->
+  <script src="/static/vendor/vue.global.prod.js"></script>
+  <script>window.Vue || document.write('<script src="https://cdn.jsdelivr.net/npm/vue@3.4.38/dist/vue.global.prod.js"><\/script>')</script>
+  <script src="/static/vendor/chart.umd.js"></script>
+  <script>window.Chart || document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"><\/script>')</script>
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- ================= Kopbalk ================= -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">CSTR</span>
+      <span class="brand-title">Digital Twin &middot; Reactor R-101</span>
+    </div>
+    <div class="topbar-status">
+      <span class="pill" :class="connected ? 'pill-ok' : 'pill-bad'">
+        <span class="dot"></span>{{ connected ? 'Verbonden' : 'Geen verbinding' }}
+      </span>
+      <span class="pill" :class="state.running ? 'pill-ok' : 'pill-idle'">
+        {{ state.running ? 'Simulatie loopt' : 'Gestopt' }}
+      </span>
+      <span class="pill" :class="controllerPillClass" :title="controllerTitle">{{ controllerLabel }}</span>
+      <span class="pill" :class="twinPillClass">{{ twinLabel }}</span>
+      <span class="clock">t = <b>{{ fmt(state.time, 2) }}</b> min</span>
+    </div>
+  </header>
+
+  <!-- ================= Alarmbalk ================= -->
+  <div v-if="state.alarm === 'trip'" class="alarm alarm-trip" role="alert">
+    <div>
+      <strong>FAILSAFE TRIP</strong> &mdash; {{ state.trip_reason }}.
+      Noodkoeling actief<span v-if="params.safety && params.safety.stop_feed_on_trip">, reactantvoeding gestopt</span>.
+    </div>
+    <button class="btn btn-light" @click="resetFailsafe" :disabled="!canResetTrip">{{ tripButtonText }}</button>
+  </div>
+  <div v-else-if="state.alarm === 'warning'" class="alarm alarm-warn" role="alert">
+    <div>
+      <strong>HOGE TEMPERATUUR</strong> &mdash; T = {{ fmt(state.T, 1) }} K boven waarschuwingsgrens
+      ({{ fmt(params.safety.T_warn, 0) }} K). Trip bij {{ fmt(params.safety.T_trip, 0) }} K.
+      Controleer de koeling (koelwaterdebiet, UA), verlaag de voeding (F of C<sub>A,in</sub>) of verlaag het setpoint.
+    </div>
+  </div>
+  <div v-if="toast" class="toast" :class="'toast-' + toast.kind">{{ toast.text }}</div>
+
+  <main class="layout">
+
+    <!-- ================= Linkerkolom ================= -->
+    <aside class="col-left">
+
+      <!-- Kerncijfers -->
+      <section class="card">
+        <h2>Procestoestand</h2>
+        <div class="kpis">
+          <div class="kpi" :class="'kpi-' + state.alarm">
+            <div class="kpi-label">Temperatuur T</div>
+            <div class="kpi-value">{{ fmt(state.T, 1) }}<span class="unit">K</span></div>
+            <div class="bar"><div class="bar-fill" :style="{ width: tempPct + '%' }"></div>
+              <div class="bar-mark warn" :style="{ left: warnPct + '%' }"></div>
+              <div class="bar-mark trip" :style="{ left: '100%' }"></div></div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Concentratie C<sub>A</sub></div>
+            <div class="kpi-value">{{ fmt(state.CA, 4) }}<span class="unit">mol/L</span></div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Conversie</div>
+            <div class="kpi-value">{{ state.conversion == null ? '–' : fmt(state.conversion * 100, 1) }}<span class="unit">%</span></div>
+          </div>
+          <div class="kpi" :class="{ 'kpi-warning': state.controller && state.controller.saturated }">
+            <div class="kpi-label">Koelmiddel T<sub>c</sub></div>
+            <div class="kpi-value">{{ params.process && params.process.cooling_mode === 'fixed' ? '–' : fmt(state.Tc, 1) }}<span class="unit">K</span></div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Koeling Q</div>
+            <div class="kpi-value">{{ fmt(state.Q_effective / 60, 0) }}<span class="unit">kW</span></div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Reactiewarmte</div>
+            <div class="kpi-value">{{ fmt(state.Q_gen / 60, 0) }}<span class="unit">kW</span></div>
+          </div>
+        </div>
+        <p class="hint warn-text" v-if="state.controller && state.controller.saturated">
+          Regelaar verzadigd: koeling staat maximaal (T<sub>c</sub> op grens). Temperatuur is niet meer te regelen.</p>
+      </section>
+
+      <!-- Trainingsscenario's -->
+      <section class="card">
+        <h2>Scenario's</h2>
+        <div class="scenarios">
+          <button v-for="s in scenarios" :key="s.key" class="btn scenario" :class="'sc-' + s.kind"
+                  :title="s.help" :aria-label="s.label" @click="runScenario(s)">{{ s.label }}</button>
+        </div>
+        <p class="hint">Beweeg over een knop voor uitleg. Gebruik daarna <b>Wat-als</b> om het verloop te voorspellen.</p>
+      </section>
+
+      <!-- Besturing -->
+      <section class="card">
+        <h2>Besturing</h2>
+        <div class="btn-row">
+          <button class="btn btn-primary" @click="control('start')" :disabled="state.running">&#9654; Start</button>
+          <button class="btn" @click="control('stop')" :disabled="!state.running">&#10073;&#10073; Stop</button>
+          <button class="btn" @click="confirmReset">&#8634; Reset</button>
+        </div>
+        <label class="field-inline">
+          <span>Snelheid</span>
+          <select :value="params.runtime && params.runtime.speed" @change="setSpeed($event.target.value)" :disabled="state.twin && state.twin.enabled && params.runtime.twin_realtime">
+            <option v-for="s in speedChoices" :key="s" :value="s">{{ s }} min/s</option>
+          </select>
+        </label>
+        <p class="hint" v-if="state.twin && state.twin.enabled && params.runtime && params.runtime.twin_realtime">
+          Twin-modus: rekent in echte tijd (1 s = 1/60 min).</p>
+        <p class="hint warn-text" v-if="state.lagging">Server rekent trager dan ingesteld (stijf regime).</p>
+      </section>
+
+      <!-- Digital Twin -->
+      <section class="card">
+        <h2>Digital Twin</h2>
+        <label class="switch">
+          <input type="checkbox" :checked="state.twin && state.twin.enabled" @change="setTwin($event.target.checked)">
+          <span class="slider"></span>
+          <span class="switch-label">Digital Twin-modus</span>
+        </label>
+        <label class="field-inline">
+          <span title="1 = toestand direct gelijkzetten aan meting; kleiner = geleidelijk bijsturen">Blend-factor</span>
+          <input type="range" min="0.05" max="1" step="0.05" v-model.number="twinBlend" @change="setTwin(state.twin.enabled)">
+          <b>{{ fmt(twinBlend, 2) }}</b>
+        </label>
+        <dl class="twin-info" v-if="state.twin">
+          <dt>Status</dt><dd :class="twinStatusClass">{{ twinStatusText }}</dd>
+          <dt>Metingen</dt><dd>{{ state.twin.count }}</dd>
+          <template v-if="state.twin.last">
+            <dt>Laatste meting</dt>
+            <dd>
+              <span v-if="state.twin.last.T != null">T {{ fmt(state.twin.last.T, 1) }} K</span>
+              <span v-if="state.twin.last.CA != null"> &middot; C<sub>A</sub> {{ fmt(state.twin.last.CA, 3) }}</span>
+              <span v-if="state.twin.last.Q != null"> &middot; Q {{ fmt(state.twin.last.Q, 0) }}</span>
+            </dd>
+            <dt title="Meting minus modelvoorspelling vlak voor synchronisatie">Modelafwijking</dt>
+            <dd>
+              <span v-if="state.twin.residual.T != null">&Delta;T {{ signed(state.twin.residual.T, 2) }} K</span>
+              <span v-if="state.twin.residual.CA != null"> &middot; &Delta;C<sub>A</sub> {{ signed(state.twin.residual.CA, 4) }}</span>
+            </dd>
+          </template>
+        </dl>
+        <details class="snippet">
+          <summary>Testmeting versturen</summary>
+          <textarea v-model="twinTestJson" rows="3" spellcheck="false"></textarea>
+          <button class="btn btn-small" @click="sendTestMeasurement">POST /api/twin</button>
+        </details>
+      </section>
+
+      <!-- Gebeurtenissen -->
+      <section class="card">
+        <h2>Gebeurtenissen</h2>
+        <ul class="events">
+          <li v-for="(e, i) in eventsReversed" :key="i" :class="'ev-' + e.level">
+            <span class="ev-time">{{ clockTime(e.wall) }}</span>{{ e.message }}
+          </li>
+          <li v-if="!eventsReversed.length" class="muted">Nog geen gebeurtenissen.</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- ================= Grafieken ================= -->
+    <section class="col-main">
+      <div class="card chart-card">
+        <div class="chart-head">
+          <h2>Temperatuur T(t)</h2>
+          <div class="legend">
+            <span><i class="lg lg-model"></i>Model T</span>
+            <span><i class="lg lg-coolant"></i>Koelmiddel T<sub>c</sub></span>
+            <span><i class="lg lg-sp"></i>Setpoint</span>
+            <span><i class="lg lg-meas"></i>Meting</span>
+            <span><i class="lg lg-pred"></i>Voorspelling</span>
+            <span><i class="lg lg-warn"></i>Waarschuwing</span>
+            <span><i class="lg lg-trip"></i>Trip</span>
+          </div>
+          <label class="field-inline compact">
+            <span>Venster</span>
+            <select v-model.number="windowMin">
+              <option :value="5">5 min</option><option :value="10">10 min</option>
+              <option :value="30">30 min</option><option :value="60">60 min</option>
+              <option :value="0">Alles</option>
+            </select>
+          </label>
+        </div>
+        <div class="chart-box"><canvas ref="chartT"></canvas></div>
+      </div>
+      <div class="card chart-card">
+        <div class="chart-head"><h2>Concentratie C<sub>A</sub>(t)</h2></div>
+        <div class="chart-box"><canvas ref="chartCA"></canvas></div>
+      </div>
+      <div class="card chart-card">
+        <div class="chart-head">
+          <h2>Warmtebalans (Semenov-diagram)</h2>
+          <div class="legend">
+            <span><i class="lg lg-gen"></i>Warmteproductie</span>
+            <span><i class="lg lg-coolant"></i>Warmteafvoer (bij huidige T<sub>c</sub>)</span>
+            <span><i class="lg lg-ss-ok"></i>Stabiel evenwicht</span>
+            <span><i class="lg lg-ss-bad"></i>Instabiel</span>
+            <span>&#10005; Nu</span>
+          </div>
+        </div>
+        <div class="chart-box chart-box-small"><canvas ref="chartHB"></canvas></div>
+        <p class="hint" v-if="heatBalance">
+          Adiabatische temperatuurstijging &Delta;T<sub>ad</sub> = {{ fmt(heatBalance.dT_ad, 0) }} K.
+          Waar de rode curve steiler loopt dan de blauwe lijn, versterkt elke graad temperatuurstijging zichzelf:
+          dat is het mechanisme van een <b>thermal runaway</b>. De regelaar verschuift de blauwe lijn door T<sub>c</sub> aan te passen.
+        </p>
+      </div>
+      <div class="card prediction" v-if="prediction">
+        <strong>Voorspelling ({{ fmt(predictionHorizon, 0) }} min vooruit):</strong>
+        eindtoestand T = {{ fmt(prediction.T[prediction.T.length - 1], 1) }} K,
+        C<sub>A</sub> = {{ fmt(prediction.CA[prediction.CA.length - 1], 4) }} mol/L,
+        T<sub>max</sub> = {{ fmt(prediction.T_max, 1) }} K.
+        <span v-if="prediction.runaway_at != null" class="bad-text">
+          &#9888; Runaway verwacht bij t &asymp; {{ fmt(prediction.runaway_at, 2) }} min (T &ge; {{ fmt(prediction.T_trip, 0) }} K)!</span>
+        <span v-else class="ok-text">Geen runaway verwacht.</span>
+        <button class="btn btn-small" @click="clearPrediction">Wissen</button>
+      </div>
+    </section>
+
+    <!-- ================= Parameters ================= -->
+    <aside class="col-right">
+      <section class="card">
+        <div class="params-head">
+          <h2>Parameters</h2>
+          <span v-if="dirtyCount" class="badge">{{ dirtyCount }} gewijzigd</span>
+        </div>
+        <div class="tabs">
+          <button v-for="g in groups" :key="g.key" class="tab" :class="{ active: activeGroup === g.key }" @click="activeGroup = g.key">{{ g.label }}</button>
+        </div>
+        <div class="param-list" v-if="draft[activeGroup]">
+          <div v-for="d in defsFor(activeGroup)" :key="d.key" class="param" :class="{ dirty: isDirty(activeGroup, d.key) }">
+            <div class="param-top">
+              <label :for="'p-' + d.key" :title="d.help">{{ d.label }}</label>
+              <span class="param-unit">{{ d.unit }}</span>
+            </div>
+            <div class="param-controls" v-if="d.type === 'select'">
+              <select :id="'p-' + d.key" v-model="draft[activeGroup][d.key]" class="grow">
+                <option v-for="o in d.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+              </select>
+            </div>
+            <div class="param-controls" v-else-if="d.type === 'bool'">
+              <label class="switch small">
+                <input type="checkbox" v-model="draft[activeGroup][d.key]"><span class="slider"></span>
+                <span class="switch-label">{{ draft[activeGroup][d.key] ? 'Aan' : 'Uit' }}</span>
+              </label>
+            </div>
+            <div class="param-controls" v-else>
+              <input type="range" :min="sliderMin(d)" :max="sliderMax(d)" :step="sliderStep(d)"
+                     :value="toSlider(d, draft[activeGroup][d.key])"
+                     @input="draft[activeGroup][d.key] = fromSlider(d, $event.target.value)">
+              <input :id="'p-' + d.key" type="number" class="num" :step="d.step || 'any'"
+                     v-model.number="draft[activeGroup][d.key]">
+            </div>
+            <div class="param-help">{{ d.help }}</div>
+          </div>
+        </div>
+        <div class="btn-row sticky-actions">
+          <button class="btn btn-primary" @click="applyParams" :disabled="!dirtyCount">Toepassen</button>
+          <button class="btn" @click="discardParams" :disabled="!dirtyCount">Annuleren</button>
+          <button class="btn" @click="runPrediction" title="Simuleer vanuit de huidige toestand met de (nog niet toegepaste) waarden">Wat-als</button>
+        </div>
+        <div class="btn-row">
+          <label class="field-inline compact"><span>Horizon</span>
+            <select v-model.number="predictionHorizon">
+              <option :value="5">5 min</option><option :value="10">10 min</option>
+              <option :value="20">20 min</option><option :value="60">60 min</option>
+            </select></label>
+          <button class="btn btn-link" @click="restoreDefaults">Standaardwaarden</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Open-loop evenwichten</h2>
+        <p class="hint">Waar de reactor naartoe loopt als T<sub>c</sub> vast blijft op
+          {{ heatBalance ? fmt(heatBalance.Tc, 1) : '–' }} K (bv. regelaar in hand).
+          Een instabiel werkpunt is normaal voor een exotherme CSTR; de regelaar houdt het stabiel.</p>
+        <table class="ss">
+          <thead><tr><th>T [K]</th><th>C<sub>A</sub> [mol/L]</th><th>Conversie</th><th>Stabiel</th></tr></thead>
+          <tbody>
+            <tr v-for="(s, i) in steadyStates" :key="i">
+              <td>{{ fmt(s.T, 1) }}</td><td>{{ fmt(s.CA, 4) }}</td><td>{{ fmt(s.conversion * 100, 1) }}%</td>
+              <td :class="s.stable ? 'ok-text' : 'bad-text'">{{ s.stable ? 'ja' : 'nee' }}</td>
+            </tr>
+            <tr v-if="!steadyStates.length"><td colspan="4" class="muted">Geen stationaire toestand tussen 100 en 1200 K.</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </aside>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

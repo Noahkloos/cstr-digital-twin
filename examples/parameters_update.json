@@ -1,0 +1,5 @@
+{
+  "process": { "UA": 550, "F": 24 },
+  "control": { "T_sp": 348 },
+  "safety": { "T_warn": 390 }
+}
